@@ -56,16 +56,28 @@ def norm_root(p: str) -> str:
     return f"/mnt/{drive}/{rest}"
 
 
-ROOT = Path(norm_root(os.environ.get("DEVIN_PROJECT_DIR") or os.getcwd()))
+try:
+    sys.stdout.reconfigure(errors="replace")  # 编码被污染（PYTHONIOENCODING=gbk 等）时 emit 不崩
+except Exception:
+    pass
+
+try:
+    ROOT = Path(norm_root(os.environ.get("DEVIN_PROJECT_DIR") or os.getcwd()))
+except Exception:  # cwd 被删等极端场景不能让模块层裸崩（fail-open 罩不到这里）
+    ROOT = Path(norm_root(os.environ.get("DEVIN_PROJECT_DIR") or "."))
 DEVIN_DIR = ROOT / ".devin"
 GOAL = DEVIN_DIR / "goal.md"
 DONE = DEVIN_DIR / "goal.done"
 STATE = DEVIN_DIR / ".goal-state"
 TRACE = STATE / "trace.log"
 HUMAN_OK = STATE / "human.ok"
+STATUS_STAMP = STATE / "status.stamp"    # 钩子最近一次写入的 status——篡改对账基准
+ESC_ATTEMPT = STATE / "esc-attempted"    # 检测到过一次非法 status 改写 → 注入警告
+BLOCKS = STATE / "blocks.count"          # 连续打回计数：用户新消息/放行/激活清零
 OFF = DEVIN_DIR / "goal-mode.off"
 BLOCKER = DEVIN_DIR / "blocker.md"
 HISTORY = DEVIN_DIR / "history.log"
+PLAN = DEVIN_DIR / "plan.md"             # 计划模式互斥探测用（只读）
 
 CHECK_TAG = re.compile(r"\[check:\s*(.+)\]", re.I)  # 贪婪到行尾最后一个 ]——命令内部允许含 ]
 HUMAN_TAG = re.compile(r"\[human\]", re.I)
@@ -110,7 +122,7 @@ OFF_RE = re.compile(
     r"(?:off|stop|clear|reset|none|cancel|end|exit|disable)\b"  # Claude 清除别名全集
     r"|(?:退出|关闭|结束|停用|取消)\s*目标模式"
     r"|goal[\s_-]*mode\s+(?:off|stop|end|disable)\b"
-    r")\s*[:：.。!！]?\s*$",
+    r")\s*[吧了啊呢嘛呀]?[:：.。!！]?\s*$",
     re.I,
 )
 STATUS_RE = re.compile(
@@ -151,10 +163,21 @@ def excerpt(body, n=800):
     return b if len(b) <= n else b[:n] + " …(截断)"
 
 
+def ensure_dir(p):
+    """目录位被同名文件占位时改名挪走再建——异常穿透顶层会静默放行整条管线。"""
+    try:
+        if p.exists() and not p.is_dir():
+            p.rename(p.with_name(p.name + f".corrupt-{int(time.time())}"))
+        p.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 def read_goal():
     if not GOAL.is_file():
         return None
-    txt = GOAL.read_text(encoding="utf-8", errors="replace")
+    txt = GOAL.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")  # Windows 编辑器常加 BOM
     fm, body = {}, txt
     m = re.match(r"^\s*---\s*\n(.*?)\n\s*---\s*\n?(.*)$", txt, re.S)
     if m:
@@ -168,7 +191,7 @@ def read_goal():
 
 def log_transition(tag, old, new):
     try:
-        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(HISTORY.parent)
         with HISTORY.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {tag}: {old} → {new}\n")
     except Exception:
@@ -176,7 +199,7 @@ def log_transition(tag, old, new):
 
 
 def write_goal(g):
-    DEVIN_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_dir(DEVIN_DIR)
     prev = read_goal()
     old = prev["fm"].get("status") if prev else "∅"
     new = g["fm"].get("status")
@@ -187,10 +210,58 @@ def write_goal(g):
     GOAL.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def stamp_status(st):
+    """钩子每次置 status 同步落印记——与文件对账可识别 agent 手工改写。"""
+    try:
+        ensure_dir(STATE)
+        STATUS_STAMP.write_text(str(st), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def set_status(g, st):
+    """钩子改 status 的唯一入口：写文件 + 落印记。"""
+    g["fm"]["status"] = st
+    write_goal(g)
+    stamp_status(st)
+
+
+def reconcile_status(g):
+    """goal.md 的 status 与印记不符 → 按方向裁定：
+    - active/blocked 是文档化的用户（或 agent）可达路径：采纳 + 更新印记；
+    - done/off/paused/乱值只能由钩子写 → 恢复印记态 + 记审计标记（对账拦篡改）。
+    """
+    if not g:
+        return None
+    st = (g["fm"].get("status") or "active").lower()
+    try:
+        stamp = STATUS_STAMP.read_text(encoding="utf-8").strip() if STATUS_STAMP.is_file() else ""
+    except Exception:
+        stamp = ""
+    if not stamp:
+        stamp_status(st)  # 无印记（旧版/手工新建）→ 采纳当前态为基线
+        return g
+    if st == stamp:
+        return g
+    if st in ("active", "blocked"):
+        stamp_status(st)  # resume / 卡点声明是设计内路径——采纳（on_stop 仍有空 blocker 门）
+        return g
+    # done / off / paused / 任意乱值：agent 自救逃逸 → 恢复并记痕
+    log_transition("goal.md", st, f"{stamp}（篡改恢复）")
+    g["fm"]["status"] = stamp
+    write_goal(g)
+    try:
+        ensure_dir(STATE)
+        ESC_ATTEMPT.write_text("1", encoding="utf-8")
+    except Exception:
+        pass
+    return g
+
+
 def active_goal():
     if OFF.is_file():
         return None
-    g = read_goal()
+    g = reconcile_status(read_goal())
     if not g or g["fm"].get("status", "active").lower() != "active":
         return None
     return g
@@ -204,14 +275,16 @@ def classify_items(body):
     """验收清单条目分类：check=钩子机检 / human=仅用户验收 / attest=agent 自证。"""
     items = []
     for l in (body or "").splitlines():
-        m = re.match(r"^\s*[-*]\s*\[([ xX✓✔])\]\s*(.*)$", l)
+        m = re.match(r"^\s*[-*+]\s*\[([ xX✓✔])\]\s*(.*)$", l)
         if not m:
             continue
         checked = m.group(1).strip().lower() in ("x", "✓", "✔")
         text = m.group(2).strip()
         cm = CHECK_TAG.search(text)
         if cm:
-            items.append({"kind": "check", "cmd": cm.group(1).strip(),
+            # 贪婪 ] 会把行尾 [human] 等标签吞进命令 → 剥掉残留尾部标签
+            cmd = re.sub(r"\]\s*\[(?:human|check)\]?.*$", "", cm.group(1)).strip()
+            items.append({"kind": "check", "cmd": cmd,
                           "label": CHECK_TAG.sub("", text).strip(), "checked": checked})
         elif HUMAN_TAG.search(text):
             # 指纹只算描述部分：批准后追加的「—— 人工验收通过」不影响比对
@@ -243,7 +316,7 @@ def approve_human_items(g):
     ok = load_human_ok()
     lines, n = [], 0
     for l in g["body"].splitlines():
-        m = re.match(r"^(\s*[-*]\s*)\[([ xX✓✔])\]\s*(.*)$", l)
+        m = re.match(r"^(\s*[-*+]\s*)\[([ xX✓✔])\]\s*(.*)$", l)
         if m and HUMAN_TAG.search(m.group(3)):
             label = HUMAN_TAG.sub("", m.group(3)).split("——")[0].strip()
             h = fp(label)
@@ -256,7 +329,7 @@ def approve_human_items(g):
                 l = f"{m.group(1)}[x] {tail}"
         lines.append(l)
     if n:
-        STATE.mkdir(parents=True, exist_ok=True)
+        ensure_dir(STATE)
         HUMAN_OK.write_text("\n".join(sorted(ok)) + "\n", encoding="utf-8")
         g["body"] = "\n".join(lines)
         write_goal(g)
@@ -280,7 +353,7 @@ def sig_bump(name, h):
     """记录签名并返回连续相同次数；内容变化则重置为 1。"""
     prev, n = sig_read(name)
     n = n + 1 if h == prev else 1
-    STATE.mkdir(parents=True, exist_ok=True)
+    ensure_dir(STATE)
     (STATE / f"{name}.sig").write_text(f"{h} {n}", encoding="utf-8")
     return n
 
@@ -341,7 +414,7 @@ def on_tool(payload):
     out = re.sub(r"\s+", " ", out).strip()[:400]
     line = f"[{time.strftime('%H:%M:%S')}] {name}({tool_summary(name, ti)}) -> {status} | {out}\n"
     try:
-        STATE.mkdir(parents=True, exist_ok=True)
+        ensure_dir(STATE)
         with TRACE.open("a", encoding="utf-8") as f:
             f.write(line)
         if TRACE.stat().st_size > TRACE_MAX:  # 有界：截断保尾部
@@ -401,8 +474,8 @@ def call_evaluator(g, items):
     model = (g["fm"].get("eval_model") or os.environ.get("ANTHROPIC_SMALL_FAST_MODEL")
              or "claude-haiku-4-5-20251001").strip()
     try:
-        timeout = int(g["fm"].get("eval_timeout") or 30)
-    except ValueError:
+        timeout = max(1, int(g["fm"].get("eval_timeout") or 30))
+    except (ValueError, TypeError):
         timeout = 30
     base = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
 
@@ -468,8 +541,7 @@ def eval_failed(payload, g, err):
         if not blocker_text():
             BLOCKER.write_text(
                 blocker_stub(g, f"评估器连续 {n} 次不可用：{err[:300]}"), encoding="utf-8")
-        g["fm"]["status"] = "paused"
-        write_goal(g)
+        set_status(g, "paused")
     # fail-open：本轮放行，目标保留（Claude 同款——hook 留着下次再评）
 
 
@@ -482,13 +554,26 @@ def clear_state():
 
 def activate(text):
     prev = read_goal() or {"fm": {}, "body": ""}
+    prev_st = (prev["fm"].get("status") or "").lower()
+    archived = ""
+    if prev_st in ("active", "paused", "blocked"):  # 覆盖存活 goal 前归档——无痕销毁是数据丢失
+        try:
+            adir = DEVIN_DIR / "goals"
+            ensure_dir(adir)
+            dst = adir / f"{time.strftime('%Y%m%d-%H%M%S')}-prev.md"
+            dst.write_bytes(GOAL.read_bytes())
+            log_transition("goal.md", prev_st, f"激活归档:{dst.name}")
+            archived = f"（原存活目标已归档 .devin/goals/{dst.name}）"
+        except Exception:
+            pass
     fm = {
         "status": "active",
         "verify": prev["fm"].get("verify", ""),
         "max_blocks": prev["fm"].get("max_blocks", str(DEFAULT_MAX_BLOCKS)),
         "created": time.strftime("%Y-%m-%d %H:%M"),
     }
-    for k in ("verify_timeout", "check_timeout", "eval_timeout", "eval_model", "strict"):
+    # strict 不继承：高强度验收是针对旧目标的策略，默认不渗漏进新目标
+    for k in ("verify_timeout", "check_timeout", "eval_timeout", "eval_model"):
         if prev["fm"].get(k):
             fm[k] = prev["fm"][k]
     body = (text or "").strip() or "<待补全：请从本轮对话提炼用户的目标写入此处，并列出验收标准>"
@@ -498,9 +583,11 @@ def activate(text):
     DONE.unlink(missing_ok=True)
     BLOCKER.unlink(missing_ok=True)
     clear_state()
+    stamp_status("active")          # 印记基线：此后 status 的非法改动可被对账发现
+    OFF.unlink(missing_ok=True)     # 调试残留的急停标记：激活即清除，否则模式名存实亡
     inject(
         "UserPromptSubmit",
-        f"[目标模式已开启] 完成条件已写入 .devin/goal.md：\n{excerpt(body, 600)}\n\n{PROTOCOL}\n\n"
+        f"[目标模式已开启] 完成条件已写入 .devin/goal.md{archived}：\n{excerpt(body, 600)}\n\n{PROTOCOL}\n\n"
         "立即开始朝条件推进——条件本身就是指令，不要停下来问用户要做什么。",
         banner="╭─ 🎯 GOAL MODE ─╯ 已开启",
     )
@@ -509,8 +596,7 @@ def activate(text):
 def deactivate():
     g = read_goal()
     if g:
-        g["fm"]["status"] = "off"
-        write_goal(g)
+        set_status(g, "off")
     DONE.unlink(missing_ok=True)
     clear_state()
     inject(
@@ -538,10 +624,16 @@ def status_report():
 
 
 def run_check(cmd, timeout):
+    """[check:]/verify 命令实跑。显式 bash：shell=True 默认 /bin/sh=dash，bashism 全哑弹。"""
     env = dict(os.environ, CI="1", FORCE_COLOR="0")
+    sh = "/bin/bash" if os.path.exists("/bin/bash") else None  # 无 bash 环境回退 /bin/sh
+    try:
+        timeout = max(1, int(timeout))
+    except (ValueError, TypeError):
+        timeout = 120
     try:
         p = subprocess.run(
-            cmd, shell=True, cwd=str(ROOT), env=env,
+            cmd, shell=True, executable=sh, cwd=str(ROOT), env=env,
             capture_output=True, text=True, errors="replace", timeout=timeout,
         )
         return p.returncode, (((p.stdout or "") + (p.stderr or "")).strip())[-1500:]
@@ -551,33 +643,31 @@ def run_check(cmd, timeout):
         return 127, f"<命令无法执行: {e}>"
 
 
-def bump_counter(payload):
-    STATE.mkdir(parents=True, exist_ok=True)
-    key = re.sub(
-        r"[^A-Za-z0-9_-]", "_",
-        f"{payload.get('session_id') or 's'}_{payload.get('prompt_id') or 'p'}",
-    )
-    f = STATE / f"{key}.count"
+def bump_counter(payload=None):
+    ensure_dir(STATE)
     try:
-        n = int(f.read_text(encoding="utf-8").strip()) + 1 if f.is_file() else 1
+        n = int(BLOCKS.read_text(encoding="utf-8").strip()) + 1 if BLOCKS.is_file() else 1
     except ValueError:
         n = 1
-    f.write_text(str(n), encoding="utf-8")
+    BLOCKS.write_text(str(n), encoding="utf-8")
     return n
+
+
+def reset_counter():
+    BLOCKS.unlink(missing_ok=True)
 
 
 def counted_block(payload, g, reason):
     """所有打回统一走这里：先计次；撞顶时写 blocker 并把目标置 paused 放行。"""
     n = bump_counter(payload)
     try:
-        maxb = int(g["fm"].get("max_blocks") or DEFAULT_MAX_BLOCKS)
-    except ValueError:
+        maxb = max(1, int(g["fm"].get("max_blocks") or DEFAULT_MAX_BLOCKS))  # 0/负值自锁死 → 钳到下界
+    except (ValueError, TypeError):
         maxb = DEFAULT_MAX_BLOCKS
     if n > maxb:
         if not blocker_text():
             BLOCKER.write_text(blocker_stub(g, "拦截次数撞顶自动暂停。"), encoding="utf-8")
-        g["fm"]["status"] = "paused"
-        write_goal(g)
+        set_status(g, "paused")
         return  # 防死循环：放行并把目标置为 paused（对应 Claude goal_check_capped）
     last = ""
     if n == maxb:
@@ -588,6 +678,21 @@ def counted_block(payload, g, reason):
     block(f"[目标模式·拦截 {n}/{maxb}] {reason}{last}")
 
 
+def plan_busy():
+    """计划模式守卫态中：此时激活目标会撞上只读保护，互斥提示。"""
+    try:
+        if not PLAN.is_file():
+            return False
+        txt = PLAN.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")
+        m = re.match(r"^\s*---\s*\n(.*?)\n\s*---", txt, re.S)
+        if not m:
+            return False
+        fm = dict(re.findall(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", m.group(1), re.M))
+        return (fm.get("status") or "").strip().lower() in ("brainstorm", "drafting", "review")
+    except Exception:
+        return False
+
+
 def on_prompt(payload):
     prompt = payload.get("prompt") or ""
     if OFF_RE.match(prompt):
@@ -596,13 +701,33 @@ def on_prompt(payload):
     if STATUS_RE.match(prompt):
         status_report()
         return
+    # /goal 后跟已知子命令词但没匹配上 = 命令误用（"/goal off 马上"曾落到 ON_RE 覆盖存活目标）
+    if re.match(
+        r"^\s*/(?:[\w.-]+:)?goal(?:[\s_-]*mode)?\s+(?:off|stop|clear|reset|none|cancel|end|exit|disable|status)\b",
+        prompt, re.I,
+    ):
+        inject("UserPromptSubmit",
+               "[目标模式] 命令用法：/goal <目标> 开启 · /goal status 查状态 · /goal off 退出。")
+        return
     m = ON_RE.match(prompt)
     if m:
+        if plan_busy():
+            inject("UserPromptSubmit",
+                   "[目标模式] ⚠️ 计划模式进行中——先说『执行计划』交接（它会自动生成目标），"
+                   "或删除 .devin/plan.md 放弃计划。")
+            return
         activate(m.group(1))
         return
     g = active_goal()
     if not g:
+        raw = read_goal()
+        st = raw and (raw["fm"].get("status") or "").lower()
+        if st in ("paused", "blocked"):
+            inject("UserPromptSubmit",
+                   f"[目标模式] 目标处于 {st} 等待位（详见 .devin/blocker.md）。"
+                   "恢复：status 改回 active 或『进入目标模式：…』重开；结束：『退出目标模式』。")
         return
+    reset_counter()  # 用户新消息 = 干预事件 → 连续打回计数清零
     if APPROVE_HUMAN_RE.match(prompt):
         n = approve_human_items(g)
         if n:
@@ -622,9 +747,15 @@ def on_prompt(payload):
     frame = f"验收 {done_n}/{len(items)}" if items else ""
     if nxt:
         frame += f" · 下一条：《{excerpt(nxt['label'], 50)}》（{kind_zh[nxt['kind']]}）"
+    # 检测到 agent 直接改 status 自救 → 警告一次（对账已恢复，这里负责告知）
+    warn = ""
+    if ESC_ATTEMPT.is_file():
+        ESC_ATTEMPT.unlink(missing_ok=True)
+        warn = ("\n⚠️ 检测到 goal.md 的 status 被直接改写为结束态，已恢复并记录——"
+                "合法出口：用户说『退出目标模式』，或写 blocker.md + status:blocked。\n")
     inject(
         "UserPromptSubmit",
-        f"[目标模式·进行中{(' · ' + frame) if frame else ''}]\n"
+        f"[目标模式·进行中{(' · ' + frame) if frame else ''}]{warn}\n"
         f"<untrusted_objective>\n{excerpt(g['body'], 300)}\n</untrusted_objective>\n"
         "完成 → 写非空 .devin/goal.done；卡住 → blocker.md + status:blocked；"
         "退出 → 用户说『退出目标模式』。",
@@ -633,7 +764,7 @@ def on_prompt(payload):
 
 
 def on_context(event):
-    g = read_goal()
+    g = reconcile_status(read_goal())
     if not g or OFF.is_file():
         return
     st = (g["fm"].get("status") or "active").lower()
@@ -646,23 +777,34 @@ def on_context(event):
         return
     if st in ("paused", "blocked") and blocker_text():
         inject(event, f"[目标模式] 遗留卡点（status={st}）：.devin/blocker.md\n{excerpt(blocker_text(), 400)}\n处理后可『进入目标模式：…』或把 status 改回 active 恢复目标。")
+        return
+    if st == "blocked" and not blocker_text():
+        # blocked 是文档化卡点出口，但没有 blocker.md 等于空声明 → 自愈回 active（与 Stop 门一致）
+        set_status(g, "active")
+        inject(event, "[目标模式] 检测到 blocked 但无卡点记录——已恢复 active，继续推进或写 .devin/blocker.md 再声明。")
+        return
+    if st == "paused":
+        inject(event, "[目标模式] 目标处于 paused 等待位（卡点见 .devin/blocker.md / history.log）。"
+                     "恢复：status 改回 active；结束：『退出目标模式』。")
 
 
 def on_stop(payload):
-    raw = read_goal()
+    raw = reconcile_status(read_goal())
     if not raw or OFF.is_file():
         return
     st = (raw["fm"].get("status") or "active").lower()
     if st == "blocked":
         # Claude 的 impossible 是清除目标；我们保留为可恢复卡点——非空 blocker.md 即交付
         if not blocker_text():
-            raw["fm"]["status"] = "active"
-            write_goal(raw)
+            set_status(raw, "active")
             counted_block(payload, raw,
                           "声明 blocked 被退回：.devin/blocker.md 为空或未写。"
                           "写清卡点（目标/卡点/已尝试/需要）再声明。")
+        else:
+            reset_counter()  # 卡点有效交付 = 正常放行 → 连打计数归零
         return
     if st != "active":
+        reset_counter()  # done/off/paused 等非执行态放行：连打计数归零
         return
     g = raw
     items = classify_items(g["body"])
@@ -721,8 +863,8 @@ def on_stop(payload):
     checks = [i for i in items if i["kind"] == "check"]
     if checks:
         try:
-            ctimeout = int(g["fm"].get("check_timeout") or g["fm"].get("verify_timeout") or 120)
-        except ValueError:
+            ctimeout = max(1, int(g["fm"].get("check_timeout") or g["fm"].get("verify_timeout") or 120))
+        except (ValueError, TypeError):
             ctimeout = 120
         failed = []
         for i in checks:
@@ -746,8 +888,8 @@ def on_stop(payload):
     verify = (g["fm"].get("verify") or "").strip()
     if verify:
         try:
-            timeout = int(g["fm"].get("verify_timeout") or 300)
-        except ValueError:
+            timeout = max(1, int(g["fm"].get("verify_timeout") or 300))
+        except (ValueError, TypeError):
             timeout = 300
         rc, tail = run_check(verify, timeout)
         if rc != 0:
@@ -786,12 +928,13 @@ def on_stop(payload):
             )
         else:
             eval_failed(payload, g, reason)   # fail-open：放行本轮，不阻塞不计数
+            reset_counter()
         return
     sig_reset("eval_fail")
     sig_bump("evals", "n")                # 评估总次数（Claude iterations 对应物）
     if result == "ok":
-        g["fm"]["status"] = "done"
-        write_goal(g)
+        reset_counter()
+        set_status(g, "done")
         log_transition("evaluator", "active", f"done: {reason[:120]}")
         return
     if result == "impossible":
@@ -799,8 +942,8 @@ def on_stop(payload):
         if not blocker_text():
             BLOCKER.write_text(
                 blocker_stub(g, f"评估器判定不可能达成：{reason}"), encoding="utf-8")
-        g["fm"]["status"] = "blocked"
-        write_goal(g)
+        reset_counter()
+        set_status(g, "blocked")
         log_transition("evaluator", "active", f"impossible: {reason[:120]}")
         return
     # not_met → 打回（格式对齐 Claude：[条件]: 评估器理由）
