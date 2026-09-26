@@ -42,12 +42,21 @@ def norm_path(p: str) -> str:
     return f"/mnt/{drive}/{rest}"
 
 
-ROOT = Path(norm_path(os.environ.get("DEVIN_PROJECT_DIR") or os.getcwd()))
+try:
+    sys.stdout.reconfigure(errors="replace")  # 编码被污染（PYTHONIOENCODING=gbk 等）时 emit 不崩
+except Exception:
+    pass
+
+try:
+    ROOT = Path(norm_path(os.environ.get("DEVIN_PROJECT_DIR") or os.getcwd()))
+except Exception:  # cwd 被删等极端场景也不能让模块层裸崩（fail-open 罩不到这里）
+    ROOT = Path(norm_path(os.environ.get("DEVIN_PROJECT_DIR") or "."))
 DEVIN_DIR = ROOT / ".devin"
 PLAN = DEVIN_DIR / "plan.md"
 STATE = DEVIN_DIR / ".plan-state"
 EPM_DEBUG = STATE / "epm-debug.log"   # exit_plan_mode 的 tool_input 键名侦察记录
 ARCHIVE = DEVIN_DIR / "plans"
+GOAL_ARCHIVE = DEVIN_DIR / "goals"      # 交接覆盖存活 goal 前的归档目录
 OFF = DEVIN_DIR / "plan-mode.off"
 GOAL = DEVIN_DIR / "goal.md"
 GOAL_DONE = DEVIN_DIR / "goal.done"
@@ -85,7 +94,7 @@ PROTOCOL = (
 
 ON_RE = re.compile(
     r"^\s*(?:"
-    r"/(?:[\w.-]+:)?plan[\w.-]*"                  # /plan-mode、/xxx:plan-mode
+    r"/(?:[\w.-]+:)?plan(?:[-_ ]?mode)?(?![\w])"  # /plan、/plan-mode、/xxx:plan-mode（不吃 /planet 这类）
     r"|(?:进入|开启|启动|打开|启用)\s*计划模式"
     r"|计划模式(?=\s*[:：])"
     r"|做个计划|先做个计划|做个规划|先规划一下|头脑风暴一下"
@@ -112,7 +121,7 @@ TEST_RE = re.compile(
 )
 APPROVE_RE = re.compile(
     r"^\s*(?:"
-    r"/(?:[\w.-]+:)?plan[\w.-]*\s+(?:approve|go|run|exec|执行)\b"
+    r"/(?:[\w.-]+:)?plan(?:[-_ ]?mode)?\s+(?:approve|go|run|exec|执行)\b"
     r"|执行计划|开始执行|批准计划|计划批准|批准执行|按(?:此|这个|该)?计划执行|就按这个做|开工吧"
     r")\s*[·,，\-—:：]?\s*(严格|宽松|strict|loose)?\s*[吧了啊]?[。.!！]?\s*$",
     re.I,
@@ -132,35 +141,57 @@ ESC_RE = re.compile(
 )
 OFF_RE = re.compile(
     r"^\s*(?:"
-    r"/(?:[\w.-]+:)?plan[\w.-]*\s+(?:off|cancel|exit|stop|clear)\b"
+    r"/(?:[\w.-]+:)?plan(?:[-_ ]?mode)?\s+(?:off|cancel|exit|stop|clear)\b"
     r"|(?:退出|关闭|取消|停用)\s*计划模式"
     r"|plan[\s_-]*mode\s+(?:off|cancel|stop)\b"
-    r")\s*[:：.。!！]?\s*$",
+    r")\s*[吧了啊呢嘛呀]?[:：.。!！]?\s*$",
     re.I,
 )
 STATUS_RE = re.compile(
     r"^\s*(?:"
-    r"/(?:[\w.-]+:)?plan[\w.-]*\s+status\b"
+    r"/(?:[\w.-]+:)?plan(?:[-_ ]?mode)?\s+status\b"
     r"|计划(?:模式)?状态"
     r"|plan[\s_-]*mode\s+status\b"
     r")\s*[?？.。]?\s*$",
     re.I,
 )
 
-# exec 写操作启发式黑名单（只读保护；宁漏勿滥）
+# exec 写操作启发式黑名单（只读保护；宁漏勿滥——advisory 层，非沙箱）
 EXEC_DENY = re.compile(
-    r"(>>?"
-    r"|\b(?:tee|rm|mv|cp|mkdir|rmdir|touch|ln|dd|mkfs|chmod|chown|sudo|kill|pkill|shutdown|reboot)\b"
+    r"(\b(?:tee|rm|mv|cp|mkdir|rmdir|touch|ln|dd|truncate|install|rsync|mkfifo|mknod|"
+    r"mkfs|chmod|chown|sudo|kill|pkill|shutdown|reboot)\b"
     r"|\bsed\b[^|;&]*\s-i\b"
-    r"|\bnpm\s+(?:i|install|ci|publish|uninstall|update)\b"
-    r"|\b(?:yarn|pnpm|bun)\s+(?:add|install|remove|update)\b"
-    r"|\bpip3?\s+(?:install|uninstall)\b"
-    r"|\b(?:apt|apt-get|brew|choco|winget)\s+(?:install|remove|uninstall)\b"
-    r"|\bgit\s+(?:add|commit|push|pull|merge|rebase|reset|restore|checkout|switch|stash|apply|am|cherry-pick|clean|init)\b"
-    r"|\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b"
+    r"|\b(?:python\d*|pythonw|perl|ruby|node|deno|php|lua|osascript)\b[^|;&]*\s+-[ce]\b"  # 解释器内联执行
+    r"|\b(?:ba|z|fi|da)?sh\b[^|;&]*\s-c\b"          # sh -c / bash -c
+    r"|\bfind\b[^|;&]*\s-delete\b"
+    r"|\bxargs\b[^|;&]*\b(?:rm|mv|cp|chmod|chown|tee|dd|sh)\b"
+    r"|\bnpm\s+(?:i|install|ci|publish|uninstall|update|run|exec|x)\b"
+    r"|\b(?:yarn|pnpm|bun)\s+(?:add|install|remove|update|x|exec|dlx)\b"
+    r"|\bpip3?\s+(?:install|uninstall)\b|\bpipx\b[^|;&]*(?:install|run)"
+    r"|\b(?:gem|cargo|composer|go)\s+install\b"
+    r"|\b(?:apt|apt-get|dnf|apk|brew|choco|winget|snap)\s+(?:install|remove|uninstall)\b"
+    r"|\bgit\b[^|;&]*\b(?:add|commit|push|pull|merge|rebase|reset|restore|checkout|switch|stash|apply|am|cherry-pick|clean|init|rm|mv)\b"  # git -C/全局 flag 后动词也命中
+    r"|\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b"   # 管道进 shell
+    r"|\b(?:curl|wget)\b[^|;&]*\s-[oO]\b"          # curl -o/wget -O 写文件
+    r"|\bbase64\b[^|;&]*\s-(?:d|D)\b"              # base64 -d 解码执行链
+    r"|\bmake\b|\b(?:gcc|g\+\+|cc|clang)\b[^|;&]*\s-o\b|\b(?:tar|zip|unzip|7z)\b[^|;&]*\s-?[cxz]"
+    r"|\b(?:systemctl|service)\b[^|;&]*\s(?:start|stop|restart|enable|disable)\b"
     r")",
     re.I,
 )
+# 无害重定向先摘除再判：2>/dev/null、2>&1 之类不视为写文件（&>file 仍拦——它确实写盘）
+SAFE_REDIR = re.compile(r"(?:\d+|&)?>>?\s*(?:&\d+\b|/dev/null\b)")
+# 引号内字面量不参与判定："echo 'a > b'"、"grep 'x > y'" 里的 > 不拦
+QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def exec_denied(cmd):
+    """剥离引号字面量与无害重定向后跑黑名单。"""
+    c = SAFE_REDIR.sub(" ", cmd)
+    c = QUOTED.sub("", c)
+    if re.search(r">>?", c):
+        return True
+    return bool(EXEC_DENY.search(c))
 
 WRITE_TOOLS = {"write", "edit", "apply_patch", "notebook_edit"}
 
@@ -201,10 +232,21 @@ def required_sections(fmt):
     return out
 
 
+def ensure_dir(p):
+    """目录位被同名文件占位时改名挪走再建——异常穿透顶层会静默放行整条管线。"""
+    try:
+        if p.exists() and not p.is_dir():
+            p.rename(p.with_name(p.name + f".corrupt-{int(time.time())}"))
+        p.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 def read_md(path):
     if not path.is_file():
         return None
-    txt = path.read_text(encoding="utf-8", errors="replace")
+    txt = path.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")  # Windows 编辑器常加 BOM
     fm, body = {}, txt
     m = re.match(r"^\s*---\s*\n(.*?)\n\s*---\s*\n?(.*)$", txt, re.S)
     if m:
@@ -219,7 +261,7 @@ def read_md(path):
 def log_transition(tag, old, new):
     """LangGraph 式 checkpoint：状态变更追加审计日志。"""
     try:
-        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(HISTORY.parent)
         with HISTORY.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {tag}: {old} → {new}\n")
     except Exception:
@@ -227,7 +269,7 @@ def log_transition(tag, old, new):
 
 
 def write_doc(path, g):
-    DEVIN_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_dir(DEVIN_DIR)
     prev = read_md(path)
     old = prev["fm"].get("status") if prev else "∅"
     new = g["fm"].get("status")
@@ -262,13 +304,15 @@ def live_plan():
     st = status_of(g)
     if st in LIVE_STATUSES:
         return g
-    if ENDED.is_file():
-        return None  # approve/handoff 正规结束（status=done）
+    if ENDED.is_file() or g["fm"].get("source") == "native-plan":
+        # approve/handoff 正规结束（ended 标记），或原生 /plan 快照留档件
+        # （source 写在 frontmatter 里自证身份，不依赖外部状态目录——防删档复活）
+        return None
     # 其他一切 status（done/off/乱写）都非钩子所置 → 硬性规则：恢复存活态并记标记。
     # 堵的是 agent 直接编辑 plan.md frontmatter 自救的洞。
     g["fm"]["status"] = "brainstorm"
     write_plan(g)
-    STATE.mkdir(parents=True, exist_ok=True)
+    ensure_dir(STATE)
     ESC_ATTEMPT.write_text("1", encoding="utf-8")
     return g
 
@@ -281,19 +325,21 @@ def clear_state():
         ESC_ATTEMPT.unlink(missing_ok=True)
 
 
-def bump_counter(payload):
-    STATE.mkdir(parents=True, exist_ok=True)
-    key = re.sub(
-        r"[^A-Za-z0-9_-]", "_",
-        f"{payload.get('session_id') or 's'}_{payload.get('prompt_id') or 'p'}",
-    )
-    f = STATE / f"{key}.count"
+BLOCKS = STATE / "blocks.count"   # 连续打回计数：单文件，用户新消息/放行/激活清零
+
+
+def bump_counter(payload=None):
+    ensure_dir(STATE)
     try:
-        n = int(f.read_text(encoding="utf-8").strip()) + 1 if f.is_file() else 1
+        n = int(BLOCKS.read_text(encoding="utf-8").strip()) + 1 if BLOCKS.is_file() else 1
     except ValueError:
         n = 1
-    f.write_text(str(n), encoding="utf-8")
+    BLOCKS.write_text(str(n), encoding="utf-8")
     return n
+
+
+def reset_counter():
+    BLOCKS.unlink(missing_ok=True)
 
 
 def goal_busy():
@@ -304,7 +350,7 @@ def goal_busy():
 
 def bump_turns():
     """计划存续期间的用户消息计数（持久化，驱动周期性完整提醒）。"""
-    STATE.mkdir(parents=True, exist_ok=True)
+    ensure_dir(STATE)
     f = STATE / "turns.count"
     try:
         n = int(f.read_text(encoding="utf-8").strip()) + 1 if f.is_file() else 1
@@ -353,7 +399,7 @@ def archive_plan(tag="archive"):
     try:
         if not PLAN.is_file() or not PLAN.read_text(encoding="utf-8", errors="replace").strip():
             return None
-        ARCHIVE.mkdir(parents=True, exist_ok=True)
+        ensure_dir(ARCHIVE)
         dst = ARCHIVE / f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.md"
         dst.write_bytes(PLAN.read_bytes())
         return dst
@@ -377,6 +423,7 @@ def activate(text, auto=False):
     )
     write_plan({"fm": fm, "body": body})
     clear_state()
+    OFF.unlink(missing_ok=True)  # 调试残留的急停标记：激活即清除，否则模式名存实亡
     note = f"（旧计划已归档：{archived}）" if archived else ""
     if auto:
         inject(
@@ -439,8 +486,24 @@ def to_tests(note):
     )
 
 
+def archive_goal():
+    """交接覆盖存活 goal 前归档到 .devin/goals/——和 plans/ 沉淀同一个道理。"""
+    try:
+        prev = read_md(GOAL)
+        if not prev or (prev["fm"].get("status") or "").lower() not in ("active", "paused", "blocked"):
+            return None
+        ensure_dir(GOAL_ARCHIVE)
+        dst = GOAL_ARCHIVE / f"{time.strftime('%Y%m%d-%H%M%S')}-handoff.md"
+        dst.write_bytes(GOAL.read_bytes())
+        log_transition("goal.md", prev["fm"].get("status"), f"交接归档:{dst.name}")
+        return dst.name
+    except Exception:
+        return None
+
+
 def handoff(g, mode=None):
     """批准交接：plan 快照进 goal.md，plan status=done，清理 goal 旧状态。"""
+    archived = archive_goal()  # 已有存活/暂停/卡点 goal → 先归档，不静默销毁
     need = excerpt(extract_section(g["body"], "预期效果"), 300)
     steps = extract_section(g["body"], "具体执行操作")
     checks = extract_section(g["body"], "验收清单")
@@ -471,8 +534,9 @@ def handoff(g, mode=None):
                 f.unlink(missing_ok=True)
     g["fm"]["status"] = "done"
     write_plan(g)
-    STATE.mkdir(parents=True, exist_ok=True)
+    ensure_dir(STATE)
     ENDED.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")  # 正规结束标记
+    return archived
 
 
 def approve(mode=None):
@@ -490,10 +554,11 @@ def approve(mode=None):
             + "\n\n请补全后重新提交评审（status: review），用户再确认执行。",
         )
         return
-    handoff(g, mode)
+    archived = handoff(g, mode)
+    note = f"\n⚠️ 原存活目标已归档 .devin/goals/{archived}（未被销毁）。\n" if archived else ""
     inject(
         "UserPromptSubmit",
-        "[计划模式] 计划与验收标准已确认 ✅ 已生成 .devin/goal.md，进入目标模式执行。\n"
+        "[计划模式] 计划与验收标准已确认 ✅ 已生成 .devin/goal.md，进入目标模式执行。\n" + note +
         "执行约定：[check:] 条目由钩子亲自执行命令判定（exit 0 才过，你的勾不作数）；[human] 条目只能用户验收"
         "（向用户展示结果，用户回复『人工验收通过』）；无标签条目验完改成 `- [x] <标准> —— <验证结果>`；"
         "硬门全过后由独立评估器读工具执行记录终审。写好非空 .devin/goal.done 才允许停止交付；"
@@ -521,16 +586,22 @@ def status_report():
     )
 
 
-def is_plan_path(p):
+def _is_devin_file(p, name):
+    """file_path 是否指向 .devin/<name>（跨 OS 归一化比较）。"""
     if not p:
         return False
     try:
         q = Path(norm_path(p))
         if not q.is_absolute():
             q = ROOT / q
-        return q.resolve() == PLAN.resolve()
+        return q.resolve() == (DEVIN_DIR / name).resolve()
     except Exception:
-        return p.replace("\\", "/").endswith(".devin/plan.md")
+        return p.replace("\\", "/").endswith(".devin/" + name)
+
+
+def allowed_write_path(p):
+    """只读期允许写的文件：plan.md 本体 + blocker.md（卡点上报是协议出口，不放开会堵死它）。"""
+    return _is_devin_file(p, "plan.md") or _is_devin_file(p, "blocker.md")
 
 
 # ---------- 事件 ----------
@@ -538,7 +609,7 @@ def is_plan_path(p):
 def epm_debug(ti):
     """侦察 exit_plan_mode 的真实入参结构（拿到结构后可删）。"""
     try:
-        STATE.mkdir(parents=True, exist_ok=True)
+        ensure_dir(STATE)
         digest = {
             k: (f"str:{len(v)}" if isinstance(v, str) else type(v).__name__)
             for k, v in (ti or {}).items()
@@ -567,7 +638,7 @@ def snapshot_native_plan(ti):
 
 
 def on_exit_plan_mode(ti, g):
-    """原生 plan 模式出口缝合：自定义计划存活→批准闸门；无计划→快照留档。"""
+    """原生 plan 模式出口缝合：自定义计划存活→批准闸门；无计划文件→快照留档。"""
     epm_debug(ti)
     if g and status_of(g) in GUARD_STATUSES:
         problems = missing_pieces(g, load_format())
@@ -580,14 +651,22 @@ def on_exit_plan_mode(ti, g):
             return
         handoff(g)  # 生成 goal.md + status=done，随后放行原生审批 UI
         return
-    if not g:
+    if not PLAN.is_file():
+        # 只在 plan.md 不存在时快照：已存在的计划文件（含 done 留档件、
+        # 已 handoff 的计划）一概不动——exit_plan_mode 不是删除计划的途径。
         snapshot_native_plan(ti)
 
 
 def on_pre(payload):
     g = live_plan()  # 用 live_plan：agent 改写 status 自救会在这里被恢复
     tool = payload.get("tool_name") or ""
-    ti = payload.get("tool_input") or {}
+    ti = payload.get("tool_input")
+    if not isinstance(ti, dict):
+        # tool_input 畸形：守卫开着时写权限类调用无法验明路径/命令 → fail-close
+        if g and status_of(g) in GUARD_STATUSES and tool in (WRITE_TOOLS | {"exec", "run_subagent"}):
+            block("[计划模式·只读保护] tool_input 结构异常，写权限类调用按拒绝处理（fail-close）。")
+            return
+        ti = {}
     if tool == "exit_plan_mode":
         on_exit_plan_mode(ti, g)
         return
@@ -604,16 +683,17 @@ def on_pre(payload):
         return
     if tool in WRITE_TOOLS:
         p = ti.get("file_path") or ti.get("notebook_path") or ""
-        if is_plan_path(p):
+        if allowed_write_path(p):
             return
         block(
             f"[计划模式·只读保护] 当前 status={status_of(g)}，禁止修改文件（{p or tool}）。\n"
-            "只能写 .devin/plan.md；要动代码，先把计划写完提交评审，等用户说『执行计划』。"
+            "只能写 .devin/plan.md（卡点时也可写 .devin/blocker.md）；"
+            "要动代码，先把计划写完提交评审，等用户说『执行计划』。"
         )
         return
     if tool == "exec":
         cmd = ti.get("command") or ""
-        if EXEC_DENY.search(cmd):
+        if exec_denied(cmd):
             block(
                 f"[计划模式·只读保护] 该命令可能修改环境，已拦截：{excerpt(cmd, 200)}\n"
                 "只读命令（ls/cat/grep/git status/跑测试等只读验证）不受影响。"
@@ -623,13 +703,15 @@ def on_pre(payload):
 def on_stop(payload):
     g = live_plan()
     if not g or status_of(g) != "drafting":
+        reset_counter()
         return  # brainstorm / review / done / off / paused 都放行
     if "❓" in g["body"] or "❔" in g["body"]:
+        reset_counter()
         return  # 计划里有标 ❓ 的未决问题 = agent 在向用户提问后结束回合，放行（Claude 回合规则的提问分支）
-    n = bump_counter(payload)
+    n = bump_counter()
     try:
-        maxb = int(g["fm"].get("max_blocks") or 12)
-    except ValueError:
+        maxb = max(1, int(g["fm"].get("max_blocks") or 12))  # 0/负值自锁死 → 钳到下界
+    except (ValueError, TypeError):
         maxb = 12
     if n == maxb:
         block(
@@ -644,6 +726,7 @@ def on_stop(payload):
         # 硬性规则：撞顶不再置 paused 放走——回到 brainstorm 停拦（防死循环）但只读约束继续生效
         g["fm"]["status"] = "brainstorm"
         write_plan(g)
+        reset_counter()
         return
     fmt = load_format()
     missing = [s for s in required_sections(fmt) if s not in g["body"]]
@@ -668,7 +751,9 @@ def on_stop(payload):
 def on_prompt(payload):
     prompt = payload.get("prompt") or ""
     if OFF_RE.match(prompt) or ESC_RE.match(prompt):
-        locked_msg()  # 硬性规则：出口只有『执行计划』
+        # 硬性规则：出口只有『执行计划』。无计划文件 = 用户不在模式里，静默不误导。
+        if PLAN.is_file():
+            locked_msg()
         return
     if STATUS_RE.match(prompt):
         status_report()
@@ -691,6 +776,13 @@ def on_prompt(payload):
         return
     m = ON_RE.match(prompt)
     if m:
+        if goal_busy():
+            inject(
+                "UserPromptSubmit",
+                "[计划模式] ⚠️ 目标模式正在执行中——现在进计划模式会冻结写权限、卡住目标推进。"
+                "请先说『退出目标模式』，或等当前目标完成后再规划。",
+            )
+            return
         activate(m.group(1))
         return
     g = live_plan()
@@ -726,6 +818,8 @@ def on_prompt(payload):
         and NUDGE_RE.search(prompt)
         and not QUESTIONISH_RE.search(prompt)
         and not goal_busy()
+        # 疑似目标模式口令不劫持进计划模式（"目标模式修复bug"是给 goal 的）
+        and not re.search(r"目标模式|goal[\s_-]*mode|/goal\b", prompt, re.I)
     ):
         activate(prompt, auto=True)
 
