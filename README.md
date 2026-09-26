@@ -50,7 +50,8 @@ cp plan-format.md        "%APPDATA%/devin/"
 # Linux/macOS 对应 ~/.config/devin/
 
 # 2. 把 config.example.json 里的 hooks 段合并进 %APPDATA%/devin/config.json
-#    注意：command 里的解释器与路径按你的环境改（见下「Shell 兼容性」）
+#    Windows 只需把 <WIN_USER> 换成你的用户名；Linux/macOS 不用改
+#    ⚠️ 勿写 C:\ 形式路径——钩子跑在 WSL 里，会锁死输入框（见「排障」节）
 ```
 
 事件注册矩阵：
@@ -103,15 +104,27 @@ goal.md frontmatter 可调项：`verify`（整体验收命令）、`strict: true
 | `ANTHROPIC_SMALL_FAST_MODEL` | 评估器模型覆盖 |
 | `DEVIN_PROJECT_DIR` | 项目根（Devin 自动注入，也可手动） |
 
-## Shell 兼容性
+## 排障 / Troubleshooting
 
-注册命令是 shell 命令——`config.example.json` 提供 bash 写法；若你的 Devin 用 cmd/PowerShell 执行钩子，改用单行形式如：
+以下全是实机踩出来的坑（Windows 侧实测结论）：
 
-```
-py -3 "C:/Users/<你>/AppData/Roaming/devin/hooks/goal-mode.py" Stop
-```
+**每条消息都被「Prompt blocked」锁死** —— 最常见
 
-`[check:]` 命令同理，推荐 `py -3 ... || python3 ...` 双落写法跨 shell 覆盖。
+钩子协议里**进程退出码 2 = block 决策**。Windows 下 Devin 经 **WSL** 执行钩子命令，如果写成 `python3 "C:\..."`（或 `C:/...`）形式，WSL python3 把 `C:` 当相对路径拼到项目目录下 → `can't open file` → exit 2 → 每条消息被 block，输入框锁死。修法：命令必须用 `/mnt/c/...` posix 路径——`config.example.json` 里的双路径自回退写法（`/mnt/c/... || $HOME/... || true`）已覆盖 Windows 与 POSIX 两种情况，改完**重开会话**生效。
+
+**改了 config 没生效**
+
+钩子注册在会话启动时读入、按会话缓存、**不热重载**——必须关掉重开会话。在旧会话里重发消息只会重演旧命令的错误。
+
+**怎么确认钩子活着**
+
+- 会话内敲 `/hooks` 看已加载钩子与命令来源
+- 手动跑一遍：`echo '{"prompt":"hi"}' | python3 /mnt/c/Users/<你>/AppData/Roaming/devin/hooks/goal-mode.py UserPromptSubmit`——有 JSON 输出即健康（无存活目标时静默退出 0 也正常）
+- `|| true` 兜底的代价是钩子崩溃时静默失效——排障第一步永远是手动跑命令，别看"没报错"就以为在跑
+
+**`[check:]` 命令的 shell**
+
+`[check:]` 命令与钩子同一执行环境（Windows=WSL bash）。跨 shell 写法推荐 `py -3 ... || python3 ...` 双落，但路径同理要用 `/mnt/c` 形式。
 
 ## 安全边界
 

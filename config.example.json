@@ -1,12 +1,14 @@
 {
   "hooks": {
+    "_comment": "钩子接线示例。命令是双路径自回退形式：先试 /mnt/c（Windows 下的 WSL 执行环境），再试 $HOME（Linux/macOS）。Windows 用户唯一要改的是把 <WIN_USER> 换成你的 Windows 用户名。⚠️ 绝对不要写 C:\\ 形式的 Windows 路径——钩子在 WSL 里跑，C:\\ 会被当成相对路径导致 python3 file-not-found 退出码 2，而钩子协议里 exit 2 = block，会把输入框锁死（Prompt blocked）。|| true 是防锁死兜底：钩子崩了静默失效而不是卡死输入。改完 config 需重开会话才生效（钩子按会话缓存，不热重载）。",
+
     "PreToolUse": [
       {
         "matcher": "^(write|edit|apply_patch|notebook_edit|exit_plan_mode)$",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PreToolUse",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" PreToolUse 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PreToolUse || true",
             "timeout": 10
           }
         ]
@@ -16,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PreToolUse",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" PreToolUse 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PreToolUse || true",
             "timeout": 10
           }
         ]
@@ -26,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PreToolUse",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" PreToolUse 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PreToolUse || true",
             "timeout": 10
           }
         ]
@@ -37,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/goal-mode.py\" PostToolUse",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/goal-mode.py\" PostToolUse 2>/dev/null || python3 \"$HOME/.config/devin/hooks/goal-mode.py\" PostToolUse || true",
             "timeout": 10
           }
         ]
@@ -48,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/goal-mode.py\" SessionStart",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/goal-mode.py\" SessionStart 2>/dev/null || python3 \"$HOME/.config/devin/hooks/goal-mode.py\" SessionStart || true",
             "timeout": 10
           }
         ]
@@ -57,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" SessionStart",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" SessionStart 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" SessionStart || true",
             "timeout": 10
           }
         ]
@@ -68,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/goal-mode.py\" UserPromptSubmit",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/goal-mode.py\" UserPromptSubmit 2>/dev/null || python3 \"$HOME/.config/devin/hooks/goal-mode.py\" UserPromptSubmit || true",
             "timeout": 10
           }
         ]
@@ -77,7 +79,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" UserPromptSubmit",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" UserPromptSubmit 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" UserPromptSubmit || true",
             "timeout": 10
           }
         ]
@@ -88,7 +90,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/goal-mode.py\" PostCompaction",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/goal-mode.py\" PostCompaction 2>/dev/null || python3 \"$HOME/.config/devin/hooks/goal-mode.py\" PostCompaction || true",
             "timeout": 10
           }
         ]
@@ -97,7 +99,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PostCompaction",
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" PostCompaction 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" PostCompaction || true",
             "timeout": 10
           }
         ]
@@ -108,8 +110,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/goal-mode.py\" Stop",
-            "timeout": 10
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/goal-mode.py\" Stop 2>/dev/null || python3 \"$HOME/.config/devin/hooks/goal-mode.py\" Stop || true",
+            "timeout": 360
           }
         ]
       },
@@ -117,8 +119,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.config/devin/hooks/plan-mode.py\" Stop",
-            "timeout": 10
+            "command": "python3 \"/mnt/c/Users/<WIN_USER>/AppData/Roaming/devin/hooks/plan-mode.py\" Stop 2>/dev/null || python3 \"$HOME/.config/devin/hooks/plan-mode.py\" Stop || true",
+            "timeout": 15
           }
         ]
       }
